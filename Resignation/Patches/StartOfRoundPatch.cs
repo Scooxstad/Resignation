@@ -1,12 +1,12 @@
 ﻿using GameNetcodeStuff;
 using HarmonyLib;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Reflection.Emit;
+using TMPro;
 using UnityEngine;
 using UnityEngine.Events;
-using System.Linq;
-using System.Linq.Expressions;
 
 namespace Resignation.Patches
 {
@@ -15,68 +15,128 @@ namespace Resignation.Patches
     internal class StartOfRoundPatch
     {
         private static InteractTrigger OpenDoorTrigger;
-        private static InteractTrigger BeginResignationTrigger;
 
-        static UnityAction<PlayerControllerB> ButtonEvent;
+        static UnityAction<PlayerControllerB> PrepareResignationEvent;
+        static UnityAction<PlayerControllerB> BeginResignationEvent;
+        static UnityAction<PlayerControllerB> CancelResignationEvent;
+
+        static Coroutine PrepareResignationCoroutine;
+        static bool isAlarmRinging;
+
+        static TextMeshProUGUI HeaderMesh;
+        static TextMeshProUGUI SubMesh;
 
         [HarmonyPatch("Start")]
         [HarmonyPostfix]
         private static void AppendResignationTrigger(StartOfRound __instance)
         {
-            Resignation.Logger.LogInfo("Instance name #1: " + __instance.gameObject.name);
-            Resignation.Logger.LogInfo("Instance name #2: " + StartOfRound.Instance.gameObject.name);
-            
-            Resignation.Logger.LogInfo(GameObject.Find("Systems/GameSystems").transform.GetChild(1).gameObject.AddComponent<EjectionFlag>());
+            GameObject maskImage = GameObject.Find("Systems/UI/Canvas/GameOverScreen/MaskImage/");
 
-            Transform DoorPanel = GameObject.Find("Environment/HangarShip/AnimatedShipDoor/HangarDoorButtonPanel").transform;
-            Transform button = DoorPanel.Find("StartButton").Find("Cube (2)");
+            GameObject headerText = maskImage.transform.Find("HeaderText").gameObject;
+            GameObject subText = maskImage.transform.Find("HeaderText (1)").gameObject;
 
+            HeaderMesh = headerText.GetComponent<TextMeshProUGUI>();
+            SubMesh = subText.GetComponent<TextMeshProUGUI>();
+
+            Transform button = GameObject.Find("Environment/HangarShip/AnimatedShipDoor/HangarDoorButtonPanel/StartButton/Cube (2)").transform;
             OpenDoorTrigger = button.GetComponent<InteractTrigger>();
 
-            // OpenDoorTrigger.holdInteraction = true;
-            // OpenDoorTrigger.timeToHold = 4f;
+            OpenDoorTrigger.holdInteraction = true;
+            OpenDoorTrigger.timeToHold = 5f;
 
-            OpenDoorTrigger.onInteract.AddListener((player) =>
-            {
-                StartResignation(player);
-            });
+            PrepareResignationEvent += PrepareResignation;
+            BeginResignationEvent += BeginResignation;
+            CancelResignationEvent += CancelResignation;
+
+            OpenDoorTrigger.onInteractEarly.AddListener(PrepareResignation);
+            OpenDoorTrigger.onInteract.AddListener(BeginResignationEvent);
+            OpenDoorTrigger.onStopInteract.AddListener(CancelResignationEvent);
         }
 
-        static void StartResignation(PlayerControllerB controller)
+        static void BeginResignation(PlayerControllerB controller)
         {
-            if (!StartOfRound.Instance.shipHasLanded)
+            if (StartOfRound.Instance.inShipPhase)
             {
-                Resignation.Logger.LogInfo(StartOfRound.Instance.gameObject.GetComponent<EjectionFlag>());
-                HUDManager.Instance.AddTextToChatOnServer("Resignation submitted");
+                ModifyGameOverDisplay();
                 StartOfRound.Instance.ManuallyEjectPlayersServerRpc();
-
             }
-
         }
 
-        class EjectionFlag : Component
+        static void PrepareResignation(PlayerControllerB controller)
         {
-
+            PrepareResignationCoroutine = StartOfRound.Instance.StartCoroutine((TriggerAlarm()));
         }
 
+        public static IEnumerator TriggerAlarm()
+        {
+            yield return new WaitForSeconds(1f);
 
-        static FieldInfo speakerAudioSourceField = AccessTools.Field(typeof(StartOfRound), nameof(StartOfRound.speakerAudioSource));
-        static MethodInfo gameObjectMethod = AccessTools.Method(typeof(Component), "get_gameObject");
-        static MethodInfo getComponentMethod = AccessTools.Method(typeof(GameObject), nameof(GameObject.GetComponent)).MakeGenericMethod(new System.Type[] {typeof(EjectionFlag)});
+            StartOfRound startOfRound = StartOfRound.Instance;
+            startOfRound.shipAnimatorObject.gameObject.GetComponent<Animator>().SetBool("AlarmRinging", true);
+            startOfRound.shipDoorAudioSource.PlayOneShot(startOfRound.alarmSFX);
+            isAlarmRinging = true;
+        }
 
+        static void CancelResignation(PlayerControllerB controller)
+        {
+            StartOfRound startOfRound = StartOfRound.Instance;
+
+            if (!startOfRound.suckingPlayersOutOfShip)
+            {
+                if (PrepareResignationCoroutine != null)
+                {
+                    startOfRound.StopCoroutine(PrepareResignationCoroutine);
+                    if (isAlarmRinging)
+                    {
+                        startOfRound.shipDoorAudioSource.Stop();
+                        startOfRound.speakerAudioSource.PlayOneShot(startOfRound.disableSpeakerSFX);
+                        startOfRound.shipAnimatorObject.gameObject.GetComponent<Animator>().SetBool("AlarmRinging", false);
+                        isAlarmRinging = false;
+                    }
+                }
+            }
+        }
+
+        [HarmonyPatch("openingDoorsSequence", MethodType.Enumerator)]
+        [HarmonyPrefix]
+        private static void ResetDoorTrigger()
+        {
+            OpenDoorTrigger.holdInteraction = false;
+        }
+
+        [HarmonyPatch("SetShipReadyToLand")]
+        [HarmonyPrefix]
+        private static void ModifyDoorTrigger()
+        {
+            OpenDoorTrigger.holdInteraction = true;
+        }
+
+        [HarmonyPatch("EndPlayersFiredSequenceClientRpc")]
+        [HarmonyPrefix]
+        private static void ResetGameOverDisplay()
+        {
+            HeaderMesh.text = "YOU ARE FIRED.";
+            HeaderMesh.fontSize = 80;
+            SubMesh.text = "You did not meet the profit quota before the deadline.";
+        }
+
+        private static void ModifyGameOverDisplay()
+        {
+            HeaderMesh.text = "YOU HAVE RESIGNED.";
+            HeaderMesh.fontSize = 63;
+            SubMesh.text = "You parted ways with The Company on amicable terms.";
+        }
+
+        static readonly MethodInfo getTimeOfDay = AccessTools.Method(typeof(TimeOfDay), "get_Instance");
+        static readonly FieldInfo timeUntilDeadlineField = AccessTools.Field(typeof(TimeOfDay), nameof(TimeOfDay.timeUntilDeadline));
 
         [HarmonyTranspiler]
         [HarmonyPatch(nameof(StartOfRound.Instance.playersFiredGameOver), MethodType.Enumerator)]
-        static IEnumerable<CodeInstruction> ModifyFiringSequence(IEnumerable<CodeInstruction> instructions, ILGenerator il, MethodBase method)
+        static IEnumerable<CodeInstruction> ModifyFiringSequence(IEnumerable<CodeInstruction> instructions, ILGenerator il)
         {
-            Resignation.Logger.LogMessage("Enumerator transpile executing");
-            Resignation.Logger.LogInfo(gameObjectMethod);
-            Resignation.Logger.LogInfo(getComponentMethod);
-            
-            //FieldInfo abridgedVersionField = AccessTools.Field(method.GetType(), "abridgedVersion");
-            Label abridgedControlLabel = il.DefineLabel();
             int ldarg0Count = 0;
-            int ldlocCount = 0;    
+            int ldlocCount = 0;
+            Label abridgedControlLabel = il.DefineLabel();
 
             foreach (CodeInstruction instruction in instructions)
             {
@@ -85,11 +145,11 @@ namespace Resignation.Patches
                     ldarg0Count++;
                     if (ldarg0Count == 4)
                     {
-                        Resignation.Logger.LogInfo("INJECTING JUMP CONDITION");
-                        yield return new CodeInstruction(OpCodes.Ldloc, 1);
-                        yield return new CodeInstruction(OpCodes.Callvirt, gameObjectMethod);
-                        //yield return new CodeInstruction(OpCodes.Callvirt, getComponentMethod);
-                        yield return new CodeInstruction(OpCodes.Brtrue, abridgedControlLabel);
+                        yield return new CodeInstruction(OpCodes.Call, getTimeOfDay);
+                        yield return new CodeInstruction(OpCodes.Ldfld, timeUntilDeadlineField);
+                        yield return new CodeInstruction(OpCodes.Ldc_R4, 0f);
+                        yield return new CodeInstruction(OpCodes.Clt);
+                        yield return new CodeInstruction(OpCodes.Brfalse, abridgedControlLabel);
                     }
                 }
 
@@ -98,11 +158,9 @@ namespace Resignation.Patches
                     ldlocCount++;
                     if (ldlocCount == 8)
                     {
-                        Resignation.Logger.LogInfo("CONTROL LABEL APPLIED");
                         instruction.labels.Add(abridgedControlLabel);
                     }
                 }
-                
                 yield return instruction;
             }
         }
